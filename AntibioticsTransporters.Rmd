@@ -1,0 +1,867 @@
+---
+title: "Antibiotics Transporters"
+author: "Lachlan Munro"
+date: "24/3/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load all libraries. 
+
+```{r}
+#Load libraries
+library(data.table)
+library(dplyr)
+library(platetools)
+library(growthcurver)
+library(openxlsx)
+library(reshape2)
+library(ggplot2)
+library(stringr)
+library(plotly)
+library(htmlwidgets)
+library(ggpointdensity)
+library(d3heatmap)
+library(tidyr)
+library(Hmisc)
+
+
+```
+
+
+Functions to covert g Values to OD. This is the same formula used when converting within the Growth Profiler software however when using the older software version the conversion isn't available. 
+
+```{r}
+
+od_LB<- function(x) {
+0.0158*(x-26.717)^0.9854
+}
+
+```
+
+Load plates data with strain information and generate a data frame. 
+This is hard-coded for positions of each strain from the "Plates.csv" file. 
+
+```{r}
+
+
+plates <- read.csv("Plates.csv", sep=";", header=TRUE)
+plates.df <- data.frame(Well = rep(num_to_well(c(1:96)),5), strain = as.vector(t(plates[,c(2:13)])), Plate = sort(rep(c(1:5), 96)))
+
+```
+
+Functions to read from csv and convert G_Values to OD, to generate growth data using Growthcurver 
+and to add strain information.
+
+
+```{r}
+
+#Fix when growthprofiler output formatting changed 
+correct_commas <- function(df){
+  data.frame(lapply(df, function(x){as.numeric(chartr(",", ".", x))}))
+}
+
+
+#Take a single CSV file of raw G values or OD values (one plate) and return a dataframe of OD values.
+generate_table <- function(filename){
+  df <- fread(filename, header=TRUE, skip="Time (min)")
+  d <- correct_commas(df)
+  colnames(d)[1] <- "time"
+  #Convert to OD if not already done in GPViewer software
+  d_od <- d
+  if(!grepl("OD", filename)){
+        d_od <- as.data.frame(apply(d[,2:97], 2, od_LB))
+        }
+  
+  d_od$time <- seq(0, by=1/3, length.out=nrow(d_od))
+  d_od[is.na(d_od)] <- 0
+  d_od <- subset(d_od, select = c(time, A1:H12))
+  #Select just the first approx. 24 hours to account for differences in run times
+  d_od <- d_od[c(1:70), ]
+  return(d_od)
+}
+
+
+#Convert dataframe to growth parameters
+generate_gpCurves <- function(df){
+  df_1 <- df[2:97]
+  gc_plate <- SummarizeGrowthByPlate(df)
+  #add column which contains Max OD 
+  maxes <- apply(df_1, 2, FUN=max)
+  gc_plate["max"] <- maxes
+  gc_plate$well <- num_to_well(1:96)
+  gc_plate$tdt <- log(2)/gc_plate$r
+  #Correct for very low growth conditions which give artificially high R. Will need to correct for OD
+  gc_plate<- mutate(gc_plate, adj.r = ifelse(r>2 & auc_e < 5, 0, r))
+  return(gc_plate)
+}
+
+#Add strain information to dataframe based on plate position
+add_strains <- function(df, n){
+  x <- ifelse(n>5, n-5, n )
+  strains = as.character(plates.df[plates.df$Plate==x,]$strain)
+  df["Strains"] <- strains
+  df["Position"] <- rep(n, 96)
+  return(df)
+ }
+
+
+generate_data <- function(file){
+  pos = as.numeric(substr(str_extract(file,  "MTP\\d+"), 4, 6))
+  df <- generate_table(file)
+  df.gp <- generate_gpCurves(df)
+  df.gp.strains <- add_strains(df.gp, pos)
+  return(df.gp.strains)
+}
+
+
+
+compoundFolder <- function(compound){
+  folder = paste("ResultCSVs", compound, sep="_")
+  return(folder)
+}
+
+#makes a summary dataframe for a full run
+make_compound_df <- function(compound){
+  folder <- compoundFolder(compound)
+  files <- list.files(paste(folder, "/", sep=""))
+  #Check if OD has already been calculated, otherwise take raw values. 
+  gvalueFiles <- grep("MTP[0123456789]+_OD.csv",files,value=TRUE)
+  if(length(gvalueFiles) == 0){
+    gvalueFiles <-  grep("MTP[0123456789]+_GValue.csv", files, value = TRUE)
+  }
+  gvalueFiles <- paste(folder, gvalueFiles, sep="/")
+  d <- lapply(gvalueFiles, generate_data)
+  df <- bind_rows(d)
+return(df)
+}
+
+#Returns the mean if both values are numbers, else the single value if one is 0
+mean_or_only <- function(x){
+  x[is.na(x)] <- 0
+  minx <- min(x)
+  maxx <- max(x)
+  ifelse(maxx > 100*minx, y <- max(x), y<- mean(x))
+  return(y)
+}
+
+#makes a summary dataframe with all neccesary values. 
+
+make_Summary_df <- function(df){
+  summ_df <- group_by(df, Strains)
+  summary_df <- summarise(summ_df, mean_max_od = mean_or_only(max), min_max_od = min(max), max_max_od=max(max), mean_rate = mean_or_only(adj.r), min_rate= min(adj.r), max_rate=max(adj.r), t_mid_mean = mean_or_only(t_mid), t_mid_max = max(t_mid), t_mid_mid = min(t_mid), min_auc = min(auc_e), max_auc = max(auc_e), mean_auc = mean_or_only(auc_e))
+}
+
+make_Summary_df_from_compound <- function(compound){
+  df <- make_compound_df(compound)
+  df <- mutate_all(df, ~replace_na(.,0))
+  summarydf <- make_Summary_df(df)
+  summarydf[,"Antibiotic"] <- compound
+  return(summarydf)
+}
+
+```
+
+Generate WT Values
+
+```{r}
+
+raw_lbDF <- make_compound_df("LB")
+
+wt_rawLB <- raw_lbDF[raw_lbDF$Strains == "wt",]
+
+mean_rate.wt_lb <- mean(wt_rawLB$adj.r[wt_rawLB$adj.r !=0])
+
+mean_AUC.wt_lb <- mean(wt_rawLB$auc_e[wt_rawLB$auc_e != 0])
+
+
+
+```
+
+
+
+Generate baseline growth rates using LB data and make histograms. 
+
+```{r}
+lb_df <- make_Summary_df_from_compound("LB")
+
+
+#Calculate WT growth rate 
+
+
+
+lb_hist_rate <- ggplot(data=lb_df, aes(max_rate)) + geom_histogram(color = "lightblue", fill="lightblue", bins=75) +
+    theme_minimal() + 
+    geom_vline(xintercept = mean_rate.wt_lb)+ #WT Rate calculated and hardcoded
+    theme(axis.text = element_text(size=12), panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("Growth Rate h"^"-1") + ylab("Strain Count")+
+    scale_x_continuous(breaks=c(0.2, 0.4,0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8)) + xlim(0, 1.5) + theme(axis.text = element_text(size=16), axis.title = element_text(size=18))
+
+lb_hist_auc <- ggplot(data=lb_df, aes(mean_auc)) + geom_histogram(color = "lightblue", fill="lightblue", bins=75) + 
+    theme_minimal() + 
+    geom_vline(xintercept = mean_AUC.wt_lb)+ #WT AUC Calculated and hardcoded.
+    theme(axis.text = element_text(size=12), panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("AUC") + ylab("Strain Count")+ theme(axis.text = element_text(size=16), axis.title = element_text(size=18))
+
+lb_hist_auc + xlim(0, 35)
+lb_hist_rate
+
+```
+
+
+```{r}
+filt.lbdf <- lb_df[!lb_df$min_max_od==0 & lb_df$max_max_od > 0,]
+
+ggplot(data = filt.lbdf, aes(x=min_rate, y=max_rate)) + geom_point() + theme_bw() + theme(axis.text = element_text(size=12), panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("Replicate 2 ") + ylab("Replicate 1")+ theme(axis.text = element_text(size=16), axis.title = element_text(size=18))
+
+ggplot(data = filt.lbdf, aes(x=min_auc, y=max_auc)) + geom_point() + theme_bw() + theme(axis.text = element_text(size=12), panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("Replicate 2 ") + ylab("Replicate 1")+ theme(axis.text = element_text(size=16), axis.title = element_text(size=18))
+
+
+```
+
+
+
+```{r}
+remove_outliers <- function(x){
+  x <- x[x!=0]
+  stddev <- sd(x)
+  m <- mean(x)
+  cutoff <- m + 2*stddev
+  x <- x[x<cutoff]
+}
+```
+
+
+
+
+
+Function to generate masters figures list and data from compound: 
+
+```{r}
+
+make_figs_compound <- function(compound){
+  media <- lb_df
+  df <- make_compound_df(compound)
+  #Exclude wt values with no growth
+  wt_vals <- df[which(df$Strains == "wt"),]
+  wt_vals <- wt_vals[wt_vals$adj.r > 0 & wt_vals$note != "questionable fit (k < n0)" & wt_vals$note != "cannot fit data",]
+  #Exclude outliers
+  wt_mean_r <- as.numeric(mean(remove_outliers(wt_vals$adj.r)))
+  wt_mean_r <- wt_mean_r/mean_rate.wt_lb                       
+  wt_sd_r <- as.numeric(sd((wt_vals$adj.r))/media[(which(media$Strains=="wt")), "mean_rate"])
+
+  wt_mean_maxOD <- as.numeric(mean(wt_vals$max)/media[(which(media$Strains=="wt")), "mean_max_od"])
+  
+  wt_mean_lag <- as.numeric(mean(wt_vals$t_mid)/media[(which(media$Strains=="wt")), "t_mid_mean"])
+  
+  
+  summ_df_orig <- make_Summary_df(df)
+  
+  summ_df_media <- merge(summ_df_orig, media, by.x="Strains", by.y="Strains")
+  names(summ_df_media) <- str_replace(names(summ_df_media), "\\.x", "_compound")
+  names(summ_df_media) <- str_replace(names(summ_df_media), "\\.y", "_media")
+  
+  summ_df_norm <- mutate(summ_df_media, mean_rate_norm = mean_rate_compound/mean_rate_media,
+                         mean_maxod_norm = mean_max_od_compound/mean_max_od_media,
+                         mean_t_mid_norm = t_mid_mean_compound/t_mid_mean_media, 
+                         mean_auc_norm = mean_auc_compound/mean_auc_media)
+  
+  summ_df_norm$Antibiotic <- compound
+  
+  # #Filter out missed Innoculations
+  f <- which(summ_df_norm$min_auc_compound < 1 & summ_df_norm$max_auc_compound > 5)
+  # summ_df_norm <- summ_df_norm[-f,]
+  
+  #Rate Histogram
+  
+  hst_rate <- ggplot(data = summ_df_norm, aes(mean_rate_norm))+
+    geom_histogram(color = "lightblue", fill="lightblue", bins=75) + 
+    theme_minimal() + 
+    geom_vline(xintercept = wt_mean_r)+
+    theme(axis.text = element_text(size=12),panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("Growth Rate Ratio ") + ylab("Strain Count")+
+    scale_x_continuous(breaks=c(0.2, 0.4,0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8)) + xlim(0, 1.5)+theme(axis.text = element_text(size=16),panel.border = element_rect(colour = "black", fill=NA, size=3), legend.text = element_text(size=16), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size=18))
+
+  #max_od_histogram
+hst_maxOD <- ggplot(data = summ_df_norm, aes(mean_maxod_norm))+
+    geom_histogram(color = "lightblue", fill="lightblue", bins=75) + 
+    theme_minimal() + 
+    geom_vline(xintercept = wt_mean_maxOD)+
+    theme(axis.text = element_text(size=12),panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("Max OD600 Ratio ") + ylab("Strain Count")+
+    scale_x_continuous(breaks=c(0.2, 0.4,0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8)) + xlim(0, 1.5)
+
+#hst_auc
+hst_auc <- ggplot(data = summ_df_norm, aes(mean_auc_norm))+
+    geom_histogram(color = "lightblue", fill="lightblue", bins=75) + 
+    theme_minimal() + 
+    geom_vline(xintercept = wt_mean_maxOD)+
+    theme(axis.text = element_text(size=16),panel.border = element_rect(colour = "black", fill=NA, size=3), legend.text = element_text(size=16), panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+    xlab("AUC Rate") + ylab("Strain Count")+theme(axis.text = element_text(size=16),panel.border = element_rect(colour = "black", fill=NA, size=3), legend.text = element_text(size=16), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size=18))
+
+hst_lag <-   ggplot(data = summ_df_norm, aes(mean_t_mid_norm))+
+    geom_histogram(color = "lightblue", fill="lightblue", bins=75) + 
+    theme_minimal() + 
+    geom_vline(xintercept = wt_mean_lag)+
+    theme(axis.text = element_text(size=12),panel.border = element_rect(colour = "black", fill=NA, size=2), legend.text = element_text(size=12))+
+    xlab("Lag Ratio") + ylab("Strain Count")+
+    scale_x_continuous(breaks=c(0.2, 0.4,0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8))
+
+auc_cor <- ggplot(data=summ_df_norm, aes(min_auc_compound, max_auc_compound)) + geom_point() + theme_minimal()
+
+    
+  return(list(rate = hst_rate, maxod = hst_maxOD, auc = hst_auc, lag = hst_lag, dataFrame = summ_df_norm, Correlation = auc_cor, Filtered = f, WT = c(wt_mean_r, wt_sd_r)))
+}
+
+
+
+
+```
+
+Generate master list of figures from all compounds 
+
+```{r}
+
+azithromycin <- make_figs_compound("Azithromycin")
+
+lb <- make_figs_compound("LB")
+
+ornidazole <- make_figs_compound("Ornidazole")
+
+cefoperazone <- make_figs_compound("Cefoperazone")
+
+chloramphenicol <- make_figs_compound("Chloramphenicol")
+
+meropenem <- make_figs_compound("Meropenem")
+
+gentamycin <- make_figs_compound("Gentamycin")
+
+zidovudine <- make_figs_compound("Zidovudine")
+
+flum <- make_figs_compound("Flumequine2")
+
+dcycloserine <- make_figs_compound("D-Cycloserine")
+
+#Redo of cefiderocool run due to very odd results 
+cefiderocol2 <- make_figs_compound("Cefiderocol2")
+cefiderocol <- make_figs_compound("Cefiderocol")
+
+
+ofloxacin <- make_figs_compound("Ofloxacin")
+
+streptomycin <- make_figs_compound("Streptomycin")
+
+rifampicin <- make_figs_compound("Rifampicin")
+
+levofloxacin <- make_figs_compound("Levofloxacin")
+
+paraquat <- make_figs_compound("ParaquatLB")
+
+trimethoprim <- make_figs_compound("Trimethoprim")
+
+phosphomycin <- make_figs_compound("Phosphomycin")
+
+ceftriaxone <- make_figs_compound("Ceftriaxone")
+
+```
+
+
+
+Making rank Figures
+```{r}
+
+checkYgene <- function(x){
+  y <- ifelse(startsWith(x, "y"), "yGene", "Not yGene")
+}
+
+make_rank_rate_fig <- function(df){
+  df <- df[order(df$mean_auc_compound),]
+  df <- mutate(df, ygene = checkYgene(Strains))
+  df$ygene[which(df$Strains == "wt")] <- "WT"
+  
+  p <- ggplot(data = df, aes(x=c(1:nrow(df)), y=mean_auc_compound)) + 
+    geom_point(aes(color = ygene), size=2, shape=4) + theme_bw() + ylab("Mean AUC") + xlab("Knockout List Ordered by Mean AUC") + theme(axis.title = element_text(size=18),
+          axis.text = element_text(size=16),
+          axis.text.x = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          panel.border = element_rect(colour = "black", size = 4)) + ylim(0, 35)
+  
+}
+
+                    
+```
+
+
+
+
+```{r}
+rank_figs <- lapply(list(lb$dataFrame, 
+                                       ornidazole$dataFrame, 
+                                       cefiderocol2$dataFrame, 
+                                       cefoperazone$dataFrame, 
+                                       meropenem$dataFrame, 
+                                       gentamycin$dataFrame, 
+                                       zidovudine$dataFrame, 
+                                       flum$dataFrame, 
+                                       dcycloserine$dataFrame, 
+                                       azithromycin$dataFrame, 
+                                       ofloxacin$dataFrame, 
+                                       streptomycin$dataFrame, 
+                                       rifampicin$dataFrame, 
+                                       paraquat$dataFrame, 
+                                       levofloxacin$dataFrame, 
+                                       phosphomycin$dataFrame,
+                                       trimethoprim$dataFrame,
+                                       ceftriaxone$dataFrame), 
+                    make_rank_rate_fig)
+
+rank_figs[[1]]
+rank_figs[[17]]
+rank_figs[[4]]
+rank_figs[[14]]
+     
+```
+
+
+
+
+```{r}
+antibiotics_vect <- c("LB", "Azithromycin", "Cefoperazone", "Ceftriaxone", "Cifoderocol2", "D-Cycloserine", "Flumequine2", "Gentamycin", "Levofloxacin",  "Meropenem" ,"Ofloxacin","Ornidazole","ParaquatLB",   "Phosphomycin","Rifampicin","Streptomycin","Trimethoprim","Zidovudine")
+
+
+```
+
+Generation of master dataframe with all data and scatterplot to highlight correlation between strains. 
+
+```{r}
+antibioticsDF <- do.call("rbind", list(lb$dataFrame, 
+                                       ornidazole$dataFrame, 
+                                       cefiderocol2$dataFrame, 
+                                       cefoperazone$dataFrame, 
+                                       meropenem$dataFrame, 
+                                       gentamycin$dataFrame, 
+                                       zidovudine$dataFrame, 
+                                       flum$dataFrame, 
+                                       dcycloserine$dataFrame, 
+                                       azithromycin$dataFrame, 
+                                       ofloxacin$dataFrame, 
+                                       streptomycin$dataFrame, 
+                                       rifampicin$dataFrame, 
+                                       paraquat$dataFrame, 
+                                       levofloxacin$dataFrame, 
+                                       phosphomycin$dataFrame,
+                                       trimethoprim$dataFrame,
+                                       ceftriaxone$dataFrame,
+                                       chloramphenicol$dataFrame))
+
+
+antibioticsDF$Antibiotic <- as.factor(antibioticsDF$Antibiotic)
+antibioticsDF$Antibiotic <- factor(antibioticsDF$Antibiotic, levels = c("LB", "Azithromycin", "Cefoperazone", "Ceftriaxone", "Cefiderocol2", "D-Cycloserine", "Flumequine2", "Gentamycin", "Levofloxacin",  "Meropenem" ,"Ofloxacin","Ornidazole","ParaquatLB",   "Phosphomycin","Rifampicin","Streptomycin","Trimethoprim","Zidovudine", "Chloramphenicol"))
+
+levels(antibioticsDF$Antibiotic) <- c("LB", "Azithromycin", "Cefoperazone", "Ceftriaxone","Chloramphenicol", "Cifoderocol", "D-Cycloserine", "Flumequine", "Gentamycin", "Levofloxacin",  "Meropenem" ,"Ofloxacin","Ornidazole","Paraquat",   "Phosphomycin","Rifampicin","Streptomycin","Trimethoprim","Zidovudine")
+
+g <- ggplot(data=antibioticsDF, aes(Antibiotic, mean_auc_compound)) + geom_boxplot() +theme_bw() + 
+    theme(axis.text.x = element_text(angle = 90), 
+        axis.title = element_text(size=18),
+          axis.text = element_text(size=16),
+        axis.title.x = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          panel.border = element_rect(colour = "black", size = 3)) + ylim(0, 40) + ylab("Mean AUC")
+  
+
+g
+
+```
+
+
+
+
+Functions to generate time course plots:
+
+```{r}
+generate_timecourse <- function(file){
+  pos = as.numeric(substr(str_extract(file,  "MTP\\d+"), 4, 6))
+  x <- ifelse(pos>5, pos-5, pos )
+  df <- generate_table(file)
+  return(df)
+}
+
+generate_timecoures_compound <- function(compound){
+  folder <- compoundFolder(compound)
+  files <- list.files(paste(folder, "/", sep=""))
+
+  gvalueFiles <- grep("MTP[0123456789]+_OD.csv",files,value=TRUE)
+  if(length(gvalueFiles) == 0){
+    gvalueFiles <-  grep("MTP[0123456789]+_GValue.csv", files, value = TRUE)
+  }
+  gvalueFiles <- paste(folder, gvalueFiles, sep="/")
+  d <- lapply(gvalueFiles, generate_timecourse)
+  df_1 <- Reduce(function(x, y) merge(x, y, by="time"), d)
+}
+
+
+extract_indices <- function(df, strain){
+  # add one to account for time column in time course data frame
+  #k < 50 is to account for weird wells that can be fit but don't actually grow
+    inds <- which(df$Strains == strain & df$note != "questionable fit (k < n0)"& df$note != "cannot fit data" )+1
+}
+
+
+make_strain_df<- function(compound, strain){
+  df <- make_compound_df(compound)
+  tc <- generate_timecoures_compound(compound)
+  wt_inds <- extract_indices(df, "wt")
+  strain_inds <- which(df$Strains == strain) +1
+  
+  wt <- tc[,wt_inds]
+  wtMean <- apply(wt, 1, mean)
+  wtSD <- apply(wt, 1, function(x) sd(x)/sqrt(length(wt_inds)))
+  
+  strain <- tc[,strain_inds]
+  strain1 <- strain[,1]
+  strain2 <- strain[,2]
+  
+  df <- data.frame(time = tc$time, wtMean, wtSD, strain1, strain2)
+  df$MeanStrain <- rowMeans(df[,c("strain1", "strain2")])
+  df
+}
+
+
+
+plot_strain <- function(df, strain, compound){
+  g <- ggplot(data=df, aes(x=time)) + geom_line(aes(y=wtMean), color = "black", size=2.5)+
+    geom_ribbon(aes(ymin=wtMean - wtSD, ymax=wtMean + wtSD), alpha = 0.2, fill = "grey")+
+    geom_line(aes(y=strain1), color = "red", size = 2) +
+    geom_line(aes(y=strain2), color = "red", size=2) + 
+    theme_minimal() + 
+    labs(x ="Time (hours)" , y = "OD600")+
+    ggtitle(paste("WT (black) vs ", strain, "(red) in ", compound)) + 
+    xlim(c(0, 30))
+    
+  g
+}
+
+plot_strain_publication <- function(df){
+  g <- ggplot(data=df, aes(x=time)) + geom_point(aes(y=wtMean), color = "black", size=2.5)+
+    geom_line(aes(y=wtMean), color = "black", size=0.5)+
+    geom_ribbon(aes(ymin=wtMean - wtSD, ymax=wtMean + wtSD), alpha = 0.2, fill = "grey")+
+    geom_point(aes(y=MeanStrain), color = "red", size = 2) +
+    geom_line(aes(y=MeanStrain), color = "red", size=0.5)+
+    #geom_point(aes(y=strain2), color = "red", size=2) + 
+    #geom_line(aes(y=strain2), color = "red", size=0.5)+
+    theme_bw() + 
+    labs(x ="Time (hours)" , y = "OD600")+
+    theme(axis.title = element_text(size=18),
+          axis.text = element_text(size=16),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour = "black", size = 4))
+}
+
+make_plot_publication <- function(compound, strain){
+  df <- make_strain_df(compound, strain)
+  p <- plot_strain_publication(df)
+  summaryWT <- SummarizeGrowth(df$time, df$wtMean)
+  sumaryStrain <- SummarizeGrowth(df$time, df$MeanStrain)
+  list(p, summaryWT, sumaryStrain)
+}
+
+make_plot <- function(compound, strain){
+  df <- make_strain_df(compound, strain)
+  p <- plot_strain(df, strain = strain, compound = compound)
+
+}
+
+```
+
+
+
+
+
+
+Code to extract sorted DF
+```{r}
+get_sorted_df <- function(figs_list){
+  df <- figs_list[[5]]
+  df <- df[order(df$mean_auc_norm),]
+}
+
+
+write_excel_table_low <- function(figs_list){
+  df <- get_sorted_df(figs_list)
+  compound <- df[1, 26]
+  df <- df[,c(1, 2, 5, 13, 27,28, 30)]
+  
+  names(df) <- c("Strain", "MaxOD", "Rate", "AUC", "Normalized MaxOD", "Normalized Rate", "Normalized AUC")
+  b <- which(df$Strain == "BLANK")
+  df <- df[-b,]
+  
+
+
+}
+
+
+l <- lapply(list(lb, azithromycin, cefoperazone,ceftriaxone, cefiderocol2,  chloramphenicol,dcycloserine, flum, gentamycin, levofloxacin, meropenem, ofloxacin, ornidazole, paraquat, phosphomycin, rifampicin, streptomycin, trimethoprim, zidovudine), write_excel_table_low)
+
+antibiotics_vect <- c("LB", "Azithromycin", "Cefoperazone", "Ceftriaxone", "Cifoderocol", "Chloramphenicol", "D-Cycloserine", "Flumequine", "Gentamycin", "Levofloxacin",  "Meropenem" ,"Ofloxacin","Ornidazole","Paraquat",   "Phosphomycin","Rifampicin","Streptomycin","Trimethoprim","Zidovudine")
+
+
+names(l) <- antibiotics_vect
+
+write.xlsx(l, "Supplementary.xlsx")
+
+
+
+```
+
+
+```{r}
+acrBlist <- lapply(c("LB", "Azithromycin", "Cefoperazone", "Ceftriaxone", "Cefiderocol2", "D-Cycloserine", "Flumequine2", "Gentamycin", "Levofloxacin",  "Meropenem" ,"Ofloxacin","Ornidazole","ParaquatLB",   "Phosphomycin","Rifampicin","Streptomycin","Trimethoprim","Zidovudine", "Chloramphenicol"), make_plot_publication, strain = "acrB")
+
+
+acrBlist[[19]][[1]]
+
+```
+
+
+Ornidazole histograms
+
+```{r}
+ornidazole[[1]]
+ornidazole[[3]]
+```
+
+
+Ornidazole figure generation: 
+
+```{r}
+ornidazole_sorted <- get_sorted_df(ornidazole)
+
+tail(ornidazole_sorted)
+
+head(ornidazole_sorted[,c(1, 27, 30)], 20)
+
+ybhR <- make_plot_publication("Ornidazole", "ybhR")
+argO <- make_plot_publication("Ornidazole", "argO")
+cysW <- make_plot_publication("Ornidazole", "cysW")
+acrB <- make_plot_publication("Ornidazole", "acrB")
+dham <- make_plot_publication("Ornidazole", "dhaM")
+ydjE <- make_plot_publication("Ornidazole", "ydjE")
+
+narU <- make_plot_publication("Ornidazole", "narU")
+
+ygaH <- make_plot_publication("Ornidazole", "ygaH")
+
+
+```
+
+Meropenem figure generation: 
+
+```{r, warning=FALSE}
+meropenem_sorted <- get_sorted_df(meropenem)
+
+tail(meropenem_sorted[,c(1, 13)])
+
+mobd <- make_plot_publication("ParaquatLB", "yifK")
+
+```
+
+
+Azithromycin figure generation: 
+
+```{r}
+
+azizSorted <- get_sorted_df(azithromycin)
+head(azizSorted[,c(1, 11, 12,13, 30)], 10)
+
+
+betT <- make_plot_publication("Azithromycin", "betT")
+tolR <- make_plot_publication("Azithromycin", "tolR")
+tolQ <- make_plot_publication("Azithromycin", "tolQ")
+tyrP <- make_plot_publication("Azithromycin", "tyrP")
+yiaM <- make_plot_publication("Azithromycin", "yiaM")
+yraQ <- make_plot_publication("Azithromycin", "yraQ")
+ydhW <- make_plot_publication("Azithromycin", "yhdW")
+ydfJ <- make_plot_publication("Azithromycin", "ydfJ")
+kgtP <- make_plot_publication("Azithromycin", "kgtP")
+
+azizSorted
+
+```
+Paraquat
+
+
+```{r, warning=FALSE}
+paraquatsorted <- get_sorted_df(paraquat)
+
+head(paraquatsorted[,c(1, 11, 12, 13)])
+
+para_ydcz <- make_plot_publication("ParaquatLB", "ydcZ")
+para_aroP <- make_plot_publication("ParaquatLB", "aroP")
+para_acrB <- make_plot_publication("ParaquatLB", "acrB")
+para_potH <- make_plot_publication("ParaquatLB", "potH")
+para_yfeO <- make_plot_publication("ParaquatLB", "potH")
+
+para_cusa <- make_plot_publication("ParaquatLB", "cusA")
+para_fief <- make_plot_publication("ParaquatLB", "fieF")
+
+```
+
+
+
+
+
+```{r}
+extractRate <- function(df){
+  r <- df$mean_rate_norm 
+}
+
+extract_auc <- function(df){
+  r <- df$mean_auc_compound
+}
+
+
+rateDF <- data.frame(do.call("cbind", lapply(list(lb$dataFrame, 
+                                       ornidazole$dataFrame, 
+                                       cefiderocol2$dataFrame, 
+                                       cefoperazone$dataFrame, 
+                                       meropenem$dataFrame, 
+                                       gentamycin$dataFrame, 
+                                       zidovudine$dataFrame, 
+                                       flum$dataFrame, 
+                                       dcycloserine$dataFrame, 
+                                       azithromycin$dataFrame, 
+                                       ofloxacin$dataFrame, 
+                                       streptomycin$dataFrame, 
+                                       rifampicin$dataFrame, 
+                                       paraquat$dataFrame, 
+                                       levofloxacin$dataFrame, 
+                                       phosphomycin$dataFrame,
+                                       trimethoprim$dataFrame,
+                                       ceftriaxone$dataFrame), extractRate)))
+
+aucDF <- data.frame(do.call("cbind", lapply(list(lb$dataFrame, 
+                                       ornidazole$dataFrame, 
+                                       cefiderocol2$dataFrame, 
+                                       cefoperazone$dataFrame, 
+                                       meropenem$dataFrame, 
+                                       gentamycin$dataFrame, 
+                                       zidovudine$dataFrame, 
+                                       flum$dataFrame, 
+                                       dcycloserine$dataFrame, 
+                                       azithromycin$dataFrame, 
+                                       ofloxacin$dataFrame, 
+                                       streptomycin$dataFrame, 
+                                       rifampicin$dataFrame, 
+                                       paraquat$dataFrame, 
+                                       levofloxacin$dataFrame, 
+                                       phosphomycin$dataFrame,
+                                       trimethoprim$dataFrame,
+                                       ceftriaxone$dataFrame), extract_auc)))
+
+
+rownames(rateDF) <- lb$dataFrame$Strains
+
+names(aucDF) <- c("LB", "Azithromycin", "Cefoperazone", "Ceftriaxone", "Cifoderocol2", "D-Cycloserine", "Flumequine2", "Gentamycin", "Levofloxacin",  "Meropenem" ,"Ofloxacin","Ornidazole","ParaquatLB",   "Phosphomycin","Rifampicin","Streptomycin","Trimethoprim","Zidovudine")
+
+ratedf.clean <- apply(rateDF, MARGIN = 1, function(x){ifelse(x > 10, 0, x)})
+
+ratedf.norm <- scale(t(ratedf.clean), center = TRUE)
+
+rownames(aucDF) <- lb$dataFrame$Strains
+
+
+
+scal.auc.df <- scale(aucDF)
+
+correlation <- cor(t(scal.auc.df))
+correlation.pvalue <- rcorr(t(scal.auc.df))$P
+
+
+hm <- d3heatmap(correlation, height = 1000, width = 1000)
+
+saveWidget(hm, "Heatmap.html")
+
+```
+
+
+Code to generate histogram of pvalues 
+
+
+```{r}
+df <- data.frame(cor = c(correlation), p = c(correlation.pvalue))
+
+ggplot(data = df, aes(x=cor)) + geom_histogram(bins=100)
+
+ggplot(data = df, aes(x=p)) + geom_histogram(color = "lightblue", fill="lightblue", bins=300) + theme_bw()+ ylab("Count") + xlab("P- Value") + theme(axis.title = element_text(size=18),
+          axis.text = element_text(size=16),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          panel.border = element_rect(colour = "black", size = 2))
+
+
+pvalhist <- ggplot(data = df, aes(x=p)) + geom_histogram(color = "lightblue", fill="lightblue", bins=300) + theme_bw()+ ylab("Count") + xlab("P- Value") + theme(axis.title = element_text(size=18),
+          axis.text = element_text(size=16),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          panel.border = element_rect(colour = "black", size = 2))
+
+
+
+```
+
+
+```{r}
+
+sig_values <- which(correlation.pvalue < 0.05/(447*446), arr.ind = TRUE)
+sig_inds <- which(correlation.pvalue < 0.05/(447*446))
+
+rows <- as.vector(sig_values[,1])
+cols <- as.vector(sig_values[,2])
+
+getInd <- function(trans){
+  which(rownames(correlation) == trans)
+}
+
+hits <- data.frame(t1 = rownames(correlation.pvalue)[rows], t2 = colnames(correlation.pvalue)[cols], Correlation = correlation[sig_inds], p_value = correlation.pvalue[sig_inds])
+
+hits.order <- hits[order(hits$p_value),]
+hits.order <- hits.order[seq(2, 50, 2),]
+
+cor.df <- as.data.frame(correlation)
+
+
+```
+
+
+```{r}
+t.scal.auc.df <- as.data.frame(t(scal.auc.df))
+
+scat <- ggplot(data = t.scal.auc.df, aes(y=ydjE, x=sapB)) + geom_point(size=3) + theme_bw()+ ylab("Normalized AUC - ∆ydjE") + xlab("Normalized AUC - ∆sapB") + geom_smooth(method=lm, se=FALSE, color ="grey") +theme(axis.title = element_text(size=18),
+          axis.text = element_text(size=16),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          panel.border = element_rect(colour = "black", size = 2)) + xlim(-4.5, 2)+ ylim(-4.5, 2)
+
+
+
+scat
+```
+
+```{r}
+
+```
+
